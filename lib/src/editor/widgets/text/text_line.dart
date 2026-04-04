@@ -18,6 +18,7 @@ import '../../../document/nodes/leaf.dart' as leaf;
 import '../box.dart';
 import '../delegate.dart';
 import '../keyboard_listener.dart';
+import '../pretext_proxy.dart';
 import '../proxy.dart';
 import 'text_selection.dart';
 
@@ -173,21 +174,48 @@ class _TextLineState extends State<TextLine> {
     final strutStyle =
         StrutStyle.fromTextStyle(textSpan.style ?? const TextStyle());
     final textAlign = _getTextAlign();
+    final textScaler = MediaQuery.textScalerOf(context);
+    final locale = Localizations.localeOf(context);
+
+    // ── Pretext path ──────────────────────────────────────────────────────
+    // When a PretextLineBreakerScope is present in the widget tree, delegate
+    // line breaking to the Pretext engine instead of Flutter's RenderParagraph.
+    // PretextRichText is a LeafRenderObjectWidget that implements
+    // RenderContentProxyBox directly, so Quill's selection / caret / hit-test
+    // machinery works identically to the RichText path.
+    //
+    // No PretextLineBreakerScope above us? Fall through to the original path.
+    final pretextLineBreaker = PretextLineBreakerScope.of(context);
+    if (pretextLineBreaker != null) {
+      return PretextRichText(
+        key: _richTextKey,
+        textSpan: textSpan,
+        textStyle: textSpan.style ?? const TextStyle(),
+        textAlign: textAlign,
+        textDirection: widget.textDirection!,
+        strutStyle: strutStyle,
+        locale: locale,
+        textScaler: textScaler,
+        lineBreaker: pretextLineBreaker,
+      );
+    }
+
+    // ── Original RichText path (unchanged) ────────────────────────────────
     final child = RichText(
       key: _richTextKey,
       text: textSpan,
       textAlign: textAlign,
       textDirection: widget.textDirection,
       strutStyle: strutStyle,
-      textScaler: MediaQuery.textScalerOf(context),
+      textScaler: textScaler,
     );
     return RichTextProxy(
       textStyle: textSpan.style ?? const TextStyle(),
       textAlign: textAlign,
       textDirection: widget.textDirection!,
       strutStyle: strutStyle,
-      locale: Localizations.localeOf(context),
-      textScaler: MediaQuery.textScalerOf(context),
+      locale: locale,
+      textScaler: textScaler,
       child: child,
     );
   }
