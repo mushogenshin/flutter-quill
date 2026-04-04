@@ -362,10 +362,19 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 
     // 3. Prepare text (analysis + measurement) — cached until text/style changes.
     //    Only the pure-arithmetic layoutWithLines() re-runs on width changes.
+    //
+    //    textScaler is passed so Pretext measures glyphs at the same effective
+    //    size as the rendering painters.  Without it, any device text-scale
+    //    factor != 1.0 causes systematic overflow (Pretext under-estimates line
+    //    widths, so more text is placed on a line than Flutter can actually fit).
     final style = (_textSpan is TextSpan)
         ? ((_textSpan as TextSpan).style ?? const TextStyle())
         : const TextStyle();
-    _prepared ??= prepareTextWithSegments(plainText, style);
+    _prepared ??= prepareTextWithSegments(
+      plainText,
+      style,
+      textScaler: _prototypePainter.textScaler,
+    );
 
     // 4. Run the Pretext line-breaking algorithm for the current column width.
     final result = layoutWithLines(_prepared!, constraints.maxWidth, lh);

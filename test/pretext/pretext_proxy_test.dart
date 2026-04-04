@@ -249,6 +249,86 @@ void main() {
     });
   });
 
+  // ─── 5. textScaler correctness ────────────────────────────────────────────
+  //
+  // Regression guard for the textScaler mismatch bug: if the engine measured
+  // segments at TextScaler.noScaling but rendered at a different scale, lines
+  // would overflow the column.  After the fix, measurement and rendering both
+  // use the same scaler so Pretext's line-fit decisions remain accurate.
+
+  group('PretextRichText widget — textScaler correctness', () {
+    Future<Size> pumpPretextScaled(
+      WidgetTester tester,
+      String text, {
+      required double columnWidth,
+      required double fontSize,
+      required TextScaler textScaler,
+    }) async {
+      final style = TextStyle(fontSize: fontSize, fontFamily: 'Ahem');
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Align(
+              alignment: Alignment.topLeft,
+              child: SizedBox(
+                width: columnWidth,
+                child: PretextRichText(
+                  textSpan: TextSpan(text: text, style: style),
+                  textStyle: style,
+                  textAlign: TextAlign.left,
+                  textDirection: TextDirection.ltr,
+                  strutStyle: StrutStyle.fromTextStyle(style),
+                  locale: const Locale('en'),
+                  textScaler: textScaler,
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      return tester
+          .renderObject<RenderBox>(find.byType(PretextRichText))
+          .size;
+    }
+
+    testWidgets('at 2× scale, line count doubles relative to noScaling',
+        (tester) async {
+      // Ahem: every char = 1em × 1em.  At noScaling, "aaa bbb" (7 chars)
+      // at 10px each = 70px < 100px column → fits on one line.
+      // At 2× scale, each char renders at 20px, so 7 chars = 140px > 100px
+      // column → must wrap to two lines.
+      const text = 'aaa bbb';
+      const col = 100.0;
+      const fs = 10.0;
+
+      final noScale =
+          await pumpPretextScaled(tester, text, columnWidth: col, fontSize: fs,
+              textScaler: TextScaler.noScaling);
+      final twoX = await pumpPretextScaled(tester, text,
+          columnWidth: col,
+          fontSize: fs,
+          textScaler: const TextScaler.linear(2));
+
+      // noScaling: fits on one line → height ≈ 10px
+      expect(noScale.height, closeTo(fs, 2.0));
+      // 2× scale: each char is 20px, so "aaa bbb" won't fit → wraps
+      expect(twoX.height, greaterThan(noScale.height));
+    });
+
+    testWidgets('scaled text height is proportional to scale factor',
+        (tester) async {
+      // Ahem 10px at 2× scale → effective 20px per char and 20px line height.
+      // "hello" (5 chars × 20px = 100px) < 200px column → one line.
+      // Height should be ≈ 20px (10 × 2).
+      final size = await pumpPretextScaled(tester, 'hello',
+          columnWidth: 200,
+          fontSize: 10,
+          textScaler: const TextScaler.linear(2));
+      expect(size.height, closeTo(20.0, 3.0));
+    });
+  });
+
   // ─── 4. Cursor-drift regression ───────────────────────────────────────────
   //
   // Pin per-line clip positions for a multi-span paragraph to catch the
