@@ -222,9 +222,20 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   /// One painter per Pretext line, laid out at unconstrained width.
   List<TextPainter> _linePainters = [];
 
-  /// Character offset of the FIRST character in each line (into the span's
-  /// plain text). _lineStartOffsets[i] is the start of line i.
+  /// Ownership boundary for each line: the first plainText offset that
+  /// "belongs" to line i.  Always 0 for line 0 (the line owns any leading
+  /// whitespace that InlineFlow stripped).  Used by [_lineIndexForOffset]
+  /// and as the selection/box clip boundary.
   List<int> _lineStartOffsets = [];
+
+  /// Plaintext offset at which each line's painter actually starts —
+  /// i.e. after InlineFlow's leading whitespace stripping.
+  /// For line 0 this equals the content start (>= 0); for all other lines
+  /// it equals _lineStartOffsets[i].  Cursor-offset arithmetic
+  /// (getOffsetForCaret, getPositionForOffset, getWordBoundary,
+  /// getBoxesForSelection) must use this, not _lineStartOffsets, so that
+  /// localOffset = plainTextOffset - painterStart is never negative.
+  List<int> _linePainterStarts = [];
 
   /// Total character count of the span's plain text.
   int _totalLength = 0;
@@ -289,7 +300,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   Offset getOffsetForCaret(TextPosition position, Rect caretPrototype) {
     if (_linePainters.isEmpty) return Offset.zero;
     final idx = _lineIndexForOffset(position.offset);
-    final localOffset = position.offset - _lineStartOffsets[idx];
+    final localOffset = position.offset - _linePainterStarts[idx];
     final local = _linePainters[idx]
         .getOffsetForCaret(TextPosition(offset: localOffset), caretPrototype);
     return local + Offset(0, idx * preferredLineHeight);
@@ -304,7 +315,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     // Query only the x-coordinate — each painter is a single logical line.
     final local =
         _linePainters[idx].getPositionForOffset(Offset(offset.dx, 0));
-    return TextPosition(offset: _lineStartOffsets[idx] + local.offset);
+    return TextPosition(offset: _linePainterStarts[idx] + local.offset);
   }
 
   @override
@@ -314,12 +325,12 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   TextRange getWordBoundary(TextPosition position) {
     if (_linePainters.isEmpty) return const TextRange(start: 0, end: 0);
     final idx = _lineIndexForOffset(position.offset);
-    final localOffset = position.offset - _lineStartOffsets[idx];
+    final localOffset = position.offset - _linePainterStarts[idx];
     final local = _linePainters[idx]
         .getWordBoundary(TextPosition(offset: localOffset));
     return TextRange(
-      start: local.start + _lineStartOffsets[idx],
-      end: local.end + _lineStartOffsets[idx],
+      start: local.start + _linePainterStarts[idx],
+      end: local.end + _linePainterStarts[idx],
     );
   }
 
@@ -328,15 +339,19 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     final lh = preferredLineHeight;
     final boxes = <TextBox>[];
     for (var i = 0; i < _linePainters.length; i++) {
-      final lineStart = _lineStartOffsets[i];
-      final lineEnd = i + 1 < _lineStartOffsets.length
+      // Ownership boundaries for clipping — line 0 owns from 0.
+      final ownStart = _lineStartOffsets[i];
+      final ownEnd = i + 1 < _lineStartOffsets.length
           ? _lineStartOffsets[i + 1]
           : _totalLength;
-      if (selection.end <= lineStart || selection.start >= lineEnd) continue;
+      if (selection.end <= ownStart || selection.start >= ownEnd) continue;
+      // Painter-relative offsets — painter starts at _linePainterStarts[i].
+      final ps = _linePainterStarts[i];
+      final painterLen = ownEnd - ps;
       final localStart =
-          (selection.start - lineStart).clamp(0, lineEnd - lineStart);
+          (selection.start - ps).clamp(0, painterLen);
       final localEnd =
-          (selection.end - lineStart).clamp(0, lineEnd - lineStart);
+          (selection.end - ps).clamp(0, painterLen);
       if (localStart >= localEnd) continue;
       final localSel =
           TextSelection(baseOffset: localStart, extentOffset: localEnd);
@@ -408,6 +423,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
       _disposeLinePainters();
       _linePainters = [];
       _lineStartOffsets = [];
+      _linePainterStarts = [];
       size = constraints.constrain(Size(constraints.maxWidth, lh));
       return;
     }
@@ -450,7 +466,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     });
 
     // Pass 2 — build one TextPainter per line, extending each painter to the
-    // START of the next line (or plainText.length for the last line).
+    // START of the next line's content (or plainText.length for the last line).
     //
     // WHY: InlineFlow strips trailing whitespace from item text. Without this
     // extension the painter only covers content characters, leaving trailing
@@ -458,17 +474,29 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     // the current line correctly, but getOffsetForCaret then queries a painter
     // whose text is shorter — returning the same pixel for any stripped
     // character, making the cursor appear frozen after pressing Space.
-    // Extending to nextLineStart includes the stripped chars in the painter
-    // so every plainText offset resolves to a distinct caret position.
+    // Extending to the next content start includes the stripped chars so every
+    // plainText offset resolves to a distinct caret position.
+    //
+    // _lineStartOffsets[0] is always 0 — line 0 owns any leading whitespace
+    // that InlineFlow stripped.  For all other lines, ownership starts where
+    // the previous line's painter ends (= this line's content start).
+    // _linePainterStarts[i] records where the painter actually begins (content
+    // start), so cursor arithmetic never produces a negative localOffset.
     final newPainters = <TextPainter>[];
+    final newOwnershipStarts = <int>[];
+    final newPainterStarts = <int>[];
     for (var i = 0; i < newStarts.length; i++) {
-      final extEnd = i + 1 < newStarts.length ? newStarts[i + 1] : plainText.length;
-      newPainters.add(_makePainter(_textSpan, newStarts[i], extEnd, constraints.maxWidth));
+      final painterStart = newStarts[i];
+      final painterEnd = i + 1 < newStarts.length ? newStarts[i + 1] : plainText.length;
+      newOwnershipStarts.add(i == 0 ? 0 : painterStart);
+      newPainterStarts.add(painterStart);
+      newPainters.add(_makePainter(_textSpan, painterStart, painterEnd, constraints.maxWidth));
     }
 
     _disposeLinePainters();
     _linePainters = newPainters;
-    _lineStartOffsets = newStarts;
+    _lineStartOffsets = newOwnershipStarts;
+    _linePainterStarts = newPainterStarts;
 
     final totalH = lh * (_linePainters.isEmpty ? 1 : _linePainters.length);
     size = constraints.constrain(Size(constraints.maxWidth, totalH));
