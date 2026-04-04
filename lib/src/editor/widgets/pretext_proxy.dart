@@ -3,102 +3,102 @@
 ///
 /// Drop-in replacement for [RichTextProxy] + [RichText] in text_line.dart.
 /// Instead of delegating line breaking to Flutter's [RenderParagraph], it
-/// accepts a [PretextLineBreaker] callback that computes break offsets using
-/// the Pretext engine. Each logical line is then painted with an individually
-/// laid-out [TextPainter], which powers caret / selection / hit-testing via
-/// the same [RenderContentProxyBox] interface used by [RenderParagraphProxy].
+/// calls the Pretext engine directly ([prepareTextWithSegments] +
+/// [layoutWithLines]) and paints each resulting line with an individually
+/// laid-out [TextPainter].
 ///
 /// ── Integration pattern ──────────────────────────────────────────────────
 ///
-/// Wrap your [QuillEditor] with [PretextLineBreakerScope]:
+/// Wrap your [QuillEditor] with [PretextScope]:
 ///
-///   PretextLineBreakerScope(
-///     lineBreaker: (text, style, maxWidth) {
-///       final prepared = prepareTextWithSegments(text, style);
-///       final result   = layoutWithLines(prepared, maxWidth, lineHeight);
-///       var offset = 0;
-///       return result.lines.map((l) { offset += l.text.length; return offset; }).toList();
-///     },
+///   PretextScope(
 ///     child: QuillEditor.basic(controller: controller),
 ///   )
 ///
-/// When no [PretextLineBreakerScope] is present, [TextLine] transparently
-/// falls back to the original [RichText] path — no behavior change.
+/// [TextLine.build] checks for a [PretextScope] ancestor and switches to
+/// [PretextRichText] when one is present.  Without a scope, [TextLine] falls
+/// back to the original [RichText] path — no behavior change for existing
+/// users of the package.
+///
+/// ── Why direct engine types instead of a function pointer ────────────────
+///
+/// An earlier design used a `PretextLineBreaker` function typedef.  That had
+/// two problems:
+///
+///   1. Dart closures are never `identical()`, so the `lineBreaker != value`
+///      guard in the setter always returned true, causing spurious
+///      `markNeedsLayout()` calls every rebuild.
+///
+///   2. The function pointer prevented caching `PreparedTextWithSegments`
+///      across layout passes.  Pretext's analysis + measurement phase is
+///      cheap but not free; it only needs to re-run when the text or style
+///      changes, not on every width-change relayout.
+///
+/// Using `PreparedTextWithSegments` directly solves both: the cached result is
+/// compared by object identity (it's only recreated when text/style change),
+/// and only the cheap `layoutWithLines()` arithmetic re-runs on resize.
 ///
 /// ── TextSpan slicing ─────────────────────────────────────────────────────
 ///
-/// Pretext returns character-offset break points for the line's PLAIN TEXT.
-/// We then slice the rich [InlineSpan] tree at those offsets so each line
-/// gets a [TextPainter] with the correct spans (bold, italic, links, etc.).
-/// [WidgetSpan]s (inline embeds) are preserved whole if they fall within the
-/// line range; they count as one character in the offset arithmetic.
+/// Pretext returns [LayoutLine] objects with character-offset boundaries into
+/// the paragraph's plain text.  We slice the rich [InlineSpan] tree at those
+/// offsets so each line's [TextPainter] carries the correct spans (bold,
+/// italic, links, etc.).  [WidgetSpan]s count as one character and are
+/// preserved whole.
 ///
 /// ── RenderContentProxyBox implementation ─────────────────────────────────
 ///
-/// The four methods Quill's selection / caret machinery depends on are:
+/// The four methods Quill's selection / caret machinery depends on:
 ///   • getPositionForOffset  — tap → document offset (hit-testing)
 ///   • getOffsetForCaret     — document offset → pixel (caret painting)
 ///   • getBoxesForSelection  — selection range → highlight rects
 ///   • getWordBoundary       — double-tap word select
 ///
-/// Each is implemented by binary-searching to the correct line and delegating
-/// to that line's [TextPainter], then adjusting offsets / y-coordinates.
+/// Each binary-searches to the correct Pretext line and delegates to that
+/// line's [TextPainter], adjusting offsets / y-coordinates as needed.
 
 import 'dart:ui' as ui show BoxHeightStyle, BoxWidthStyle;
 
 import 'package:flutter/rendering.dart';
 import 'package:flutter/widgets.dart';
+import 'package:pretext_engine/pretext_engine.dart'
+    show PreparedTextWithSegments, layoutWithLines, prepareTextWithSegments;
+
 import 'box.dart';
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ─── Scope ────────────────────────────────────────────────────────────────────
 
-/// Computes Pretext line-break offsets for [text] rendered with [style] inside
-/// a column of [maxWidth] pixels.
+/// Marker [InheritedWidget] that activates Pretext line-breaking for every
+/// [TextLine] in the subtree.
 ///
-/// Returns a list of EXCLUSIVE end offsets into [text] — one per line.
-/// The last entry should equal (or be close to) [text.length].
+/// Place this above [QuillEditor].  [TextLine.build] calls [PretextScope.of]
+/// and switches to [PretextRichText] when the scope is present.
 ///
-/// Example return value for a two-line paragraph: `[28, 56]`.
-typedef PretextLineBreaker = List<int> Function(
-  String text,
-  TextStyle style,
-  double maxWidth,
-);
-
-/// InheritedWidget that makes a [PretextLineBreaker] available to every
-/// [TextLine] widget in the subtree without explicit parameter threading.
-///
-/// Place this above [QuillEditor] in the widget tree.  [TextLine.build] calls
-/// [PretextLineBreakerScope.of] and, when non-null, switches to the Pretext
-/// rendering path; otherwise it falls back to the original [RichText] path.
-class PretextLineBreakerScope extends InheritedWidget {
-  const PretextLineBreakerScope({
-    required this.lineBreaker,
+/// The scope carries no configuration data — the engine derives line height
+/// from the text style's [TextStyle.fontSize] via [TextPainter.preferredLineHeight].
+class PretextScope extends InheritedWidget {
+  const PretextScope({
     required super.child,
     super.key,
   });
 
-  final PretextLineBreaker lineBreaker;
-
-  /// Returns the nearest [PretextLineBreaker] from the widget tree, or null
-  /// if no [PretextLineBreakerScope] has been placed above this context.
-  static PretextLineBreaker? of(BuildContext context) {
-    return context
-        .dependOnInheritedWidgetOfExactType<PretextLineBreakerScope>()
-        ?.lineBreaker;
+  /// Returns true if a [PretextScope] is present above [context].
+  static bool isActive(BuildContext context) {
+    return context.dependOnInheritedWidgetOfExactType<PretextScope>() != null;
   }
 
+  /// Never notifies — the scope is stateless; presence/absence is all that
+  /// matters, and that is detected by widget-tree structure, not value change.
   @override
-  bool updateShouldNotify(PretextLineBreakerScope old) =>
-      old.lineBreaker != lineBreaker;
+  bool updateShouldNotify(PretextScope old) => false;
 }
 
 // ─── Widget ───────────────────────────────────────────────────────────────────
 
 /// Replacement for [RichTextProxy] + [RichText].
 ///
-/// Produces a [RenderPretextLine] that uses [lineBreaker] to determine where
-/// lines end and paints each line with its own [TextPainter].
+/// Produces a [RenderPretextLine] that calls the Pretext engine to determine
+/// where lines break, then paints each line with its own [TextPainter].
 class PretextRichText extends LeafRenderObjectWidget {
   const PretextRichText({
     required this.textSpan,
@@ -108,7 +108,6 @@ class PretextRichText extends LeafRenderObjectWidget {
     required this.strutStyle,
     required this.locale,
     required this.textScaler,
-    required this.lineBreaker,
     super.key,
   });
 
@@ -119,7 +118,6 @@ class PretextRichText extends LeafRenderObjectWidget {
   final StrutStyle strutStyle;
   final Locale locale;
   final TextScaler textScaler;
-  final PretextLineBreaker lineBreaker;
 
   @override
   RenderPretextLine createRenderObject(BuildContext context) {
@@ -131,7 +129,6 @@ class PretextRichText extends LeafRenderObjectWidget {
       strutStyle: strutStyle,
       locale: locale,
       textScaler: textScaler,
-      lineBreaker: lineBreaker,
     );
   }
 
@@ -145,29 +142,29 @@ class PretextRichText extends LeafRenderObjectWidget {
       ..textDirection = textDirection
       ..strutStyle = strutStyle
       ..locale = locale
-      ..textScaler = textScaler
-      ..lineBreaker = lineBreaker;
+      ..textScaler = textScaler;
   }
 }
 
 // ─── RenderObject ─────────────────────────────────────────────────────────────
 
-/// A [RenderBox] that implements [RenderContentProxyBox] using Pretext line
-/// breaks instead of Flutter's [RenderParagraph].
+/// A [RenderBox] that implements [RenderContentProxyBox] using the Pretext
+/// layout engine instead of Flutter's [RenderParagraph].
 ///
 /// Layout:
-///   1. Call [lineBreaker] with the span's plain text + constraints.maxWidth.
-///   2. Slice the rich [InlineSpan] at the returned break offsets.
-///   3. Build one [TextPainter] per line, laid out with NO maxWidth constraint
-///      (identical to [pretext_article_view.dart] convention — the line text is
-///      already broken; re-constraining it would let Flutter re-break it).
+///   1. Call [prepareTextWithSegments] (analysis + measurement).  Result is
+///      cached by object identity — only re-runs when [_textSpan] or style
+///      changes, NOT on every width-change relayout.
+///   2. Call [layoutWithLines] with the cached prepared data and the current
+///      [constraints.maxWidth].  Pure arithmetic — fast on every resize.
+///   3. Slice the rich [InlineSpan] at each [LayoutLine] boundary and build
+///      one [TextPainter] per line, laid out with NO maxWidth constraint.
 ///   4. Report size as (maxWidth, lineHeight × lineCount).
 ///
 /// Paint: paint each [TextPainter] at Offset(0, lineIndex × lineHeight).
 ///
 /// Position queries: binary-search to the correct line, delegate to that
-/// line's [TextPainter], and adjust the returned offset / rect by the line's
-/// character start offset or y-position.
+/// line's [TextPainter], adjust offsets / y-coordinates.
 class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   RenderPretextLine({
     required InlineSpan textSpan,
@@ -177,11 +174,9 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     required StrutStyle strutStyle,
     required Locale locale,
     required TextScaler textScaler,
-    required PretextLineBreaker lineBreaker,
   })  : _textSpan = textSpan,
-        _lineBreaker = lineBreaker,
         // Prototype painter: measures a single space to derive preferredLineHeight
-        // without running a full layout. Same technique as RenderParagraphProxy.
+        // without running a full layout — same technique as RenderParagraphProxy.
         _prototypePainter = TextPainter(
           text: TextSpan(text: ' ', style: textStyle),
           textAlign: textAlign,
@@ -194,8 +189,12 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   // ── Fields ─────────────────────────────────────────────────────────────────
 
   InlineSpan _textSpan;
-  PretextLineBreaker _lineBreaker;
   final TextPainter _prototypePainter;
+
+  /// Cached result of [prepareTextWithSegments].  Invalidated (set to null)
+  /// when [_textSpan] or any style property changes.  Only the cheap
+  /// [layoutWithLines] arithmetic re-runs on width-only changes.
+  PreparedTextWithSegments? _prepared;
 
   /// One painter per Pretext line, laid out at unconstrained width.
   List<TextPainter> _linePainters = [];
@@ -204,26 +203,22 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   /// plain text). _lineStartOffsets[i] is the start of line i.
   List<int> _lineStartOffsets = [];
 
-  /// Total character count of the span's plain text — used in getBoxesForSelection.
+  /// Total character count of the span's plain text.
   int _totalLength = 0;
 
-  // ── Setters (each triggers relayout) ──────────────────────────────────────
+  // ── Setters (each triggers relayout; text/style changes also clear cache) ──
 
   set textSpan(InlineSpan value) {
     if (_textSpan == value) return;
     _textSpan = value;
-    markNeedsLayout();
-  }
-
-  set lineBreaker(PretextLineBreaker value) {
-    if (_lineBreaker == value) return;
-    _lineBreaker = value;
+    _prepared = null; // text changed — must re-prepare
     markNeedsLayout();
   }
 
   set textStyle(TextStyle value) {
     if (_prototypePainter.text!.style == value) return;
     _prototypePainter.text = TextSpan(text: ' ', style: value);
+    _prepared = null; // style affects measurement — must re-prepare
     markNeedsLayout();
   }
 
@@ -242,6 +237,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   set textScaler(TextScaler value) {
     if (_prototypePainter.textScaler == value) return;
     _prototypePainter.textScaler = value;
+    _prepared = null; // scaler affects measurement
     markNeedsLayout();
   }
 
@@ -254,6 +250,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   set locale(Locale value) {
     if (_prototypePainter.locale == value) return;
     _prototypePainter.locale = value;
+    _prepared = null; // locale can affect font selection and metrics
     markNeedsLayout();
   }
 
@@ -261,9 +258,9 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 
   @override
   double get preferredLineHeight {
-    // Use the prototype painter — layout() is called inside performLayout,
-    // but preferredLineHeight is also queried before layout for sizing hints.
     // The prototype painter is always kept in sync with the current style.
+    // We must call layout() here because preferredLineHeight is queried before
+    // performLayout (e.g. for block sizing hints).
     if (!_prototypePainter.debugDisposed) {
       _prototypePainter.layout();
     }
@@ -286,7 +283,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     final lh = preferredLineHeight;
     // Clamp line index to valid range.
     final idx = (offset.dy / lh).floor().clamp(0, _linePainters.length - 1);
-    // Query only the x-coordinate — the painter is a single logical line.
+    // Query only the x-coordinate — each painter is a single logical line.
     final local =
         _linePainters[idx].getPositionForOffset(Offset(offset.dx, 0));
     return TextPosition(offset: _lineStartOffsets[idx] + local.offset);
@@ -317,10 +314,11 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
       final lineEnd = i + 1 < _lineStartOffsets.length
           ? _lineStartOffsets[i + 1]
           : _totalLength;
-      // Check overlap with selection.
       if (selection.end <= lineStart || selection.start >= lineEnd) continue;
-      final localStart = (selection.start - lineStart).clamp(0, lineEnd - lineStart);
-      final localEnd = (selection.end - lineStart).clamp(0, lineEnd - lineStart);
+      final localStart =
+          (selection.start - lineStart).clamp(0, lineEnd - lineStart);
+      final localEnd =
+          (selection.end - lineStart).clamp(0, lineEnd - lineStart);
       if (localStart >= localEnd) continue;
       final localSel =
           TextSelection(baseOffset: localStart, extentOffset: localEnd);
@@ -329,7 +327,6 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
         boxHeightStyle: ui.BoxHeightStyle.max,
         boxWidthStyle: ui.BoxWidthStyle.tight,
       )) {
-        // Shift each box down by this line's y-offset.
         boxes.add(TextBox.fromLTRBD(
           box.left,
           box.top + i * lh,
@@ -351,7 +348,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
         minWidth: constraints.minWidth, maxWidth: constraints.maxWidth);
     final lh = _prototypePainter.preferredLineHeight;
 
-    // 2. Extract plain text and call the Pretext line breaker.
+    // 2. Extract plain text.
     final plainText = _textSpan.toPlainText(includeSemanticsLabels: false);
     _totalLength = plainText.length;
 
@@ -363,26 +360,27 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
       return;
     }
 
-    final breakStyle = (_textSpan is TextSpan)
+    // 3. Prepare text (analysis + measurement) — cached until text/style changes.
+    //    Only the pure-arithmetic layoutWithLines() re-runs on width changes.
+    final style = (_textSpan is TextSpan)
         ? ((_textSpan as TextSpan).style ?? const TextStyle())
         : const TextStyle();
+    _prepared ??= prepareTextWithSegments(plainText, style);
 
-    // breakOffsets: exclusive end of each line (e.g. [12, 28, 45]).
-    // Last entry should be == plainText.length (or very close to it).
-    final breakOffsets = _lineBreaker(plainText, breakStyle, constraints.maxWidth);
+    // 4. Run the Pretext line-breaking algorithm for the current column width.
+    final result = layoutWithLines(_prepared!, constraints.maxWidth, lh);
 
-    // 3. Derive per-line [start, end) ranges and build/update TextPainters.
+    // 5. Build one TextPainter per Pretext line by slicing the rich InlineSpan.
     final newPainters = <TextPainter>[];
     final newStarts = <int>[];
     var cursor = 0;
-    for (final end in breakOffsets) {
-      final clampedEnd = end.clamp(cursor, plainText.length);
+    for (final line in result.lines) {
       newStarts.add(cursor);
-      newPainters.add(_makePainter(_textSpan, cursor, clampedEnd));
-      cursor = clampedEnd;
+      final end = (cursor + line.text.length).clamp(0, plainText.length).toInt();
+      newPainters.add(_makePainter(_textSpan, cursor, end));
+      cursor = end;
     }
-    // If the breaker didn't cover the full text (rounding / edge cases),
-    // add a final line for the remainder.
+    // Safety: if Pretext didn't consume all text (edge case), add remainder.
     if (cursor < plainText.length) {
       newStarts.add(cursor);
       newPainters.add(_makePainter(_textSpan, cursor, plainText.length));
@@ -392,7 +390,6 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     _linePainters = newPainters;
     _lineStartOffsets = newStarts;
 
-    // 4. Compute total height. Width is maxWidth (line is full-bleed like RichText).
     final totalH = lh * _linePainters.length;
     size = constraints.constrain(Size(constraints.maxWidth, totalH));
   }
@@ -420,16 +417,15 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   /// Creates and lays out a [TextPainter] for the plain-text slice [start, end)
   /// of [span], preserving rich formatting.
   ///
-  /// IMPORTANT: layout() is called with NO maxWidth constraint. The line text
-  /// has already been broken by Pretext; re-constraining would let Flutter run
-  /// its own line breaker on the fragment, which can produce a different break
-  /// (due to shaper rounding vs. TextPainter.maxIntrinsicWidth divergence) and
-  /// cause lines to stack on top of each other. See pretext_article_view.dart
-  /// for the full explanation.
+  /// IMPORTANT: layout() is called with NO maxWidth constraint.  The line text
+  /// has already been broken by Pretext; re-constraining would trigger Flutter's
+  /// own line breaker, which can produce a different break point due to shaper
+  /// rounding vs. TextPainter.maxIntrinsicWidth divergence and cause lines to
+  /// stack on top of each other.  See pretext_article_view.dart for the full
+  /// explanation.
   TextPainter _makePainter(InlineSpan span, int start, int end) {
-    final sliced = _clipSpan(span, start, end);
     return TextPainter(
-      text: sliced,
+      text: _clipSpan(span, start, end),
       textAlign: _prototypePainter.textAlign,
       textDirection: _prototypePainter.textDirection,
       textScaler: _prototypePainter.textScaler,
@@ -446,7 +442,6 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 
   /// Returns the index of the line that contains [documentOffset].
   int _lineIndexForOffset(int documentOffset) {
-    // Walk backwards: the first lineStart that is <= documentOffset is our line.
     for (var i = _lineStartOffsets.length - 1; i >= 0; i--) {
       if (documentOffset >= _lineStartOffsets[i]) return i;
     }
@@ -459,38 +454,36 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 // Extracts characters [start, end) from an InlineSpan tree, preserving all
 // rich formatting (style, recognizer, semanticsLabel) from every ancestor span.
 //
-// Algorithm: depth-first walk, tracking a mutable character offset. For each
-// TextSpan.text, compute the overlap of [start, end) with the span's character
-// range. For WidgetSpan, preserve it whole when its offset falls in [start, end)
-// (it counts as 1 character in TextPainter's offset arithmetic).
+// Algorithm: depth-first walk, tracking a mutable character cursor. For each
+// TextSpan.text, compute the overlap with [start, end). For WidgetSpan, include
+// it whole when its offset falls within the range (it counts as 1 character in
+// TextPainter's offset arithmetic).
 
 InlineSpan _clipSpan(InlineSpan root, int start, int end) {
-  var offset = 0; // mutable cursor shared across the recursive walk
+  var cursor = 0; // mutable offset shared across the recursive walk
 
   InlineSpan? clip(InlineSpan span) {
     if (span is TextSpan) {
       final text = span.text ?? '';
-      final spanTextStart = offset;
-      final spanTextEnd = offset + text.length;
+      final spanStart = cursor;
+      final spanEnd = cursor + text.length;
 
-      // Clip the span's own text.
       String? clippedText;
-      if (text.isNotEmpty && spanTextEnd > start && spanTextStart < end) {
-        final lo = (start - spanTextStart).clamp(0, text.length);
-        final hi = (end - spanTextStart).clamp(0, text.length);
+      if (text.isNotEmpty && spanEnd > start && spanStart < end) {
+        final lo = (start - spanStart).clamp(0, text.length);
+        final hi = (end - spanStart).clamp(0, text.length);
         clippedText = lo < hi ? text.substring(lo, hi) : null;
       }
-      offset += text.length;
+      cursor += text.length;
 
-      // Recurse into children.
       List<InlineSpan>? clippedChildren;
       if (span.children != null) {
-        final childResults = <InlineSpan>[];
+        final results = <InlineSpan>[];
         for (final child in span.children!) {
-          final clipped = clip(child);
-          if (clipped != null) childResults.add(clipped);
+          final c = clip(child);
+          if (c != null) results.add(c);
         }
-        clippedChildren = childResults.isEmpty ? null : childResults;
+        clippedChildren = results.isEmpty ? null : results;
       }
 
       if (clippedText == null && clippedChildren == null) return null;
@@ -504,14 +497,12 @@ InlineSpan _clipSpan(InlineSpan root, int start, int end) {
     }
 
     if (span is WidgetSpan) {
-      // WidgetSpan counts as 1 character. Include it if its position is in range.
-      final pos = offset;
-      offset += 1;
+      final pos = cursor;
+      cursor += 1;
       return (pos >= start && pos < end) ? span : null;
     }
 
-    // Unknown span type — skip.
-    return null;
+    return null; // unknown span type — skip
   }
 
   return clip(root) ?? TextSpan(style: (root is TextSpan) ? root.style : null);

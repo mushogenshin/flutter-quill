@@ -13,8 +13,10 @@ dependencies:
   flutter_localizations:
     sdk: flutter
   
-  flutter_quill: ^11.0.0-dev.4
-  flutter_quill_extensions: ^11.0.0-dev.3
+  flutter_quill_pretext:
+    path: ../
+  flutter_quill_extensions:
+    path: ../flutter_quill_extensions
   path: ^1.9.0
 
 dev_dependencies:
@@ -26,7 +28,7 @@ dev_dependencies:
     sdk: flutter
 
 dependency_overrides:
-  flutter_quill:
+  flutter_quill_pretext:
     path: ../
   flutter_quill_extensions:
     path: ../flutter_quill_extensions
