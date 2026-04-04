@@ -465,26 +465,49 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
       newStarts.add(lineStart);
     });
 
-    // Pass 2 — build one TextPainter per line, extending each painter to the
-    // START of the next line's content (or plainText.length for the last line).
+    // Pass 2 — build one TextPainter per line.
     //
-    // WHY: InlineFlow strips trailing whitespace from item text. Without this
-    // extension the painter only covers content characters, leaving trailing
-    // spaces/newlines "unowned". _lineIndexForOffset maps those positions to
-    // the current line correctly, but getOffsetForCaret then queries a painter
-    // whose text is shorter — returning the same pixel for any stripped
-    // character, making the cursor appear frozen after pressing Space.
-    // Extending to the next content start includes the stripped chars so every
-    // plainText offset resolves to a distinct caret position.
+    // ── Why painters extend to the NEXT line's content start ─────────────────
     //
-    // Build painters.  For line 0 the painter starts at 0 (not contentStart),
-    // so any leading whitespace InlineFlow stripped is still owned by the
-    // painter.  This means cursor arithmetic (localOffset = position - lineStart)
-    // is always non-negative: a cursor placed before stripped content (e.g.
-    // right after a paragraph split that left " def" with offset 0 pointing
-    // before the space) resolves correctly instead of producing localOffset=-1
-    // which TextPainter interprets as end-of-text.
-    // For all other lines contentStart == ownershipStart, so no adjustment needed.
+    // InlineFlow strips trailing whitespace (spaces, the inter-word gap) from
+    // every item before measuring.  That means newStarts[i+1] is the content
+    // start of line i+1, while the stripped space(s) sit in the gap
+    // [newStarts[i] + contentLen, newStarts[i+1]).
+    //
+    // If a painter only covers [newStarts[i], newStarts[i]+contentLen), those
+    // gap positions belong to line i according to _lineIndexForOffset, but the
+    // painter is shorter than the range it is asked to handle.  When Quill
+    // calls getOffsetForCaret for a cursor sitting on a trailing space (e.g.
+    // right after typing Space), localOffset falls outside the painter's text
+    // and TextPainter returns the same pixel as the last character — making the
+    // cursor appear frozen / not advancing after each Space press.
+    //
+    // Fix: extend every painter to newStarts[i+1] (the last painter to
+    // plainText.length).  The extra whitespace characters are invisible to the
+    // reader but give TextPainter a valid position for every plainText offset
+    // this line owns, so the cursor always advances correctly.
+    //
+    // ── Why line 0's painter starts at 0, not newStarts[0] ───────────────────
+    //
+    // InlineFlow also strips LEADING whitespace from item text before analysis.
+    // For all lines except line 0, stripped leading whitespace is the
+    // inter-line gap: it was the tail of the previous line's painter (see
+    // above) and is already covered.
+    //
+    // Line 0 has no previous painter.  If the paragraph begins with a space —
+    // which happens when Quill splits "abc def" at offset 3 (right before the
+    // space), producing a new paragraph " def" — then newStarts[0] = 1
+    // (the content start, after the space).  A painter built from offset 1
+    // cannot answer cursor queries at offset 0.  Quill places the insertion
+    // point at offset 0 immediately after the split; getOffsetForCaret then
+    // computes localOffset = 0 - 1 = -1, which TextPainter treats as
+    // end-of-text and returns the pixel position of the LAST character — so
+    // the caret jumps to the end of "def" instead of the start of the line.
+    //
+    // Starting line 0's painter at 0 includes the leading space, so offset 0
+    // maps to "before the space" (the visual start of the line) and the caret
+    // is placed correctly.  For lines 1…n leading whitespace is never at a
+    // lower offset than newStarts[i], so no adjustment is needed there.
     final newPainters = <TextPainter>[];
     final newOwnershipStarts = <int>[];
     for (var i = 0; i < newStarts.length; i++) {
