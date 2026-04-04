@@ -433,32 +433,38 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
       );
     }
 
-    // Walk InlineFlow line ranges and build one TextPainter per line via
-    // _clipSpan.  Each InlineFlowFragmentRange carries itemIndex + start/end
-    // LayoutCursors; _itemContentStart[] + _cursorToUtf16() convert those
-    // directly to UTF-16 offsets in plainText — no text materialisation or
-    // fuzzy string matching needed.
-    final newPainters = <TextPainter>[];
+    // Pass 1 — collect the plainText start offset of each visual line.
+    //
+    // Only the first fragment's cursor is needed: it gives the exact UTF-16
+    // position in plainText where this line's content begins (past any leading
+    // whitespace that InlineFlow stripped from the item).
     final newStarts = <int>[];
 
     walkInlineFlowLineRanges(_preparedFlow!, constraints.maxWidth, (line) {
       if (line.fragments.isEmpty) return;
       final firstFrag = line.fragments.first;
-      final lastFrag = line.fragments.last;
-
       final firstSegs = _preparedFlow!.segmentsForItem(firstFrag.itemIndex)!;
       final lineStart = _itemContentStart[firstFrag.itemIndex]
           + _cursorToUtf16(firstSegs, firstFrag.start);
-
-      final lastSegs = _preparedFlow!.segmentsForItem(lastFrag.itemIndex)!;
-      final lineEnd = _itemContentStart[lastFrag.itemIndex]
-          + _cursorToUtf16(lastSegs, lastFrag.end);
-
-      if (lineEnd <= lineStart) return;
       newStarts.add(lineStart);
-      newPainters.add(
-          _makePainter(_textSpan, lineStart, lineEnd, constraints.maxWidth));
     });
+
+    // Pass 2 — build one TextPainter per line, extending each painter to the
+    // START of the next line (or plainText.length for the last line).
+    //
+    // WHY: InlineFlow strips trailing whitespace from item text. Without this
+    // extension the painter only covers content characters, leaving trailing
+    // spaces/newlines "unowned". _lineIndexForOffset maps those positions to
+    // the current line correctly, but getOffsetForCaret then queries a painter
+    // whose text is shorter — returning the same pixel for any stripped
+    // character, making the cursor appear frozen after pressing Space.
+    // Extending to nextLineStart includes the stripped chars in the painter
+    // so every plainText offset resolves to a distinct caret position.
+    final newPainters = <TextPainter>[];
+    for (var i = 0; i < newStarts.length; i++) {
+      final extEnd = i + 1 < newStarts.length ? newStarts[i + 1] : plainText.length;
+      newPainters.add(_makePainter(_textSpan, newStarts[i], extEnd, constraints.maxWidth));
+    }
 
     _disposeLinePainters();
     _linePainters = newPainters;
