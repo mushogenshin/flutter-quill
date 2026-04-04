@@ -66,6 +66,7 @@ import 'package:pretext_engine/pretext_engine.dart'
         InlineFlowItem,
         InlineFlowLine,
         PreparedInlineFlow,
+        countInlineFlowLines,
         prepareInlineFlow,
         walkInlineFlowLines;
 
@@ -343,6 +344,42 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   }
 
   // ── Layout & Paint ─────────────────────────────────────────────────────────
+
+  /// Computes the box size without building [TextPainter]s.
+  ///
+  /// Flutter calls this during dry-layout passes (e.g. [IntrinsicHeight],
+  /// [LayoutBuilder] probing).  The default [RenderBox] fallback would
+  /// invoke the full [performLayout], creating and disposing painters that
+  /// are thrown away immediately.  Here we use [countInlineFlowLines] —
+  /// pure arithmetic after the cached [_preparedFlow] is available — to
+  /// get the line count cheaply, avoiding all [TextPainter] allocation.
+  @override
+  Size computeDryLayout(BoxConstraints constraints) {
+    _prototypePainter.layout(
+        minWidth: constraints.minWidth, maxWidth: constraints.maxWidth);
+    final lh = _prototypePainter.preferredLineHeight;
+
+    final plainText = _textSpan.toPlainText(includeSemanticsLabels: false);
+    if (plainText.isEmpty) {
+      return constraints.constrain(Size(constraints.maxWidth, lh));
+    }
+
+    // Reuse the cached flow if available; build a throw-away one otherwise.
+    // We do NOT cache the result here because dry layout may be called with
+    // different constraints than the eventual performLayout, and overwriting
+    // _preparedFlow with one prepared at the wrong scaler/style would break
+    // the subsequent real layout.
+    final flow = _preparedFlow ?? prepareInlineFlow(
+      _extractRichItems(_textSpan)
+          .map((r) => InlineFlowItem(text: r.text, style: r.style))
+          .toList(),
+      textScaler: _prototypePainter.textScaler,
+    );
+
+    final lineCount = countInlineFlowLines(flow, constraints.maxWidth);
+    return constraints.constrain(
+        Size(constraints.maxWidth, lh * (lineCount == 0 ? 1 : lineCount)));
+  }
 
   @override
   void performLayout() {
