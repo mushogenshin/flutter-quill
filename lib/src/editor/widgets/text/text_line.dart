@@ -178,15 +178,14 @@ class _TextLineState extends State<TextLine> {
     final locale = Localizations.localeOf(context);
 
     // ── Pretext path ──────────────────────────────────────────────────────
-    // When a PretextLineBreakerScope is present in the widget tree, delegate
-    // line breaking to the Pretext engine instead of Flutter's RenderParagraph.
+    // When PretextScope is present in the widget tree, delegate line breaking
+    // to the Pretext engine instead of Flutter's RenderParagraph.
     // PretextRichText is a LeafRenderObjectWidget that implements
     // RenderContentProxyBox directly, so Quill's selection / caret / hit-test
     // machinery works identically to the RichText path.
     //
-    // No PretextLineBreakerScope above us? Fall through to the original path.
-    final pretextLineBreaker = PretextLineBreakerScope.of(context);
-    if (pretextLineBreaker != null) {
+    // No PretextScope above us? Fall through to the original path.
+    if (PretextScope.isActive(context)) {
       return PretextRichText(
         key: _richTextKey,
         textSpan: textSpan,
@@ -196,7 +195,6 @@ class _TextLineState extends State<TextLine> {
         strutStyle: strutStyle,
         locale: locale,
         textScaler: textScaler,
-        lineBreaker: pretextLineBreaker,
       );
     }
 
