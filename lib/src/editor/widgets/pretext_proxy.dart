@@ -371,19 +371,35 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     final result = layoutWithLines(_prepared!, constraints.maxWidth, lh);
 
     // 5. Build one TextPainter per Pretext line by slicing the rich InlineSpan.
+    //
+    // CURSOR DRIFT FIX: line.text is built from Pretext's *normalised* text
+    // (whitespace collapsed, trailing \n stripped), but plainText is the raw
+    // toPlainText() output which may be longer.  Using line.text.length to
+    // advance through plainText causes cumulative drift that manifests as
+    // mid-word splits (e.g. "connec" + "t").
+    //
+    // Instead we use _advanceCursor(), which walks plainText character-by-
+    // character matching against line.text and skips chars that were removed
+    // by normalisation (extra spaces, collapsed \n, etc.).
     final newPainters = <TextPainter>[];
     final newStarts = <int>[];
     var cursor = 0;
     for (final line in result.lines) {
       newStarts.add(cursor);
-      final end = (cursor + line.text.length).clamp(0, plainText.length).toInt();
-      newPainters.add(_makePainter(_textSpan, cursor, end));
+      final end = _advanceCursor(plainText, cursor, line.text);
+      newPainters.add(_makePainter(_textSpan, cursor, end, constraints.maxWidth));
       cursor = end;
     }
-    // Safety: if Pretext didn't consume all text (edge case), add remainder.
+    // Safety: consume any remaining plainText not covered by Pretext lines
+    // (typically the trailing \n that normalisation strips from Quill paragraphs).
+    // Skip whitespace-only remainders — they are normalisation artifacts and
+    // should not produce an extra visible line.
     if (cursor < plainText.length) {
-      newStarts.add(cursor);
-      newPainters.add(_makePainter(_textSpan, cursor, plainText.length));
+      final remainder = plainText.substring(cursor);
+      if (remainder.trim().isNotEmpty) {
+        newStarts.add(cursor);
+        newPainters.add(_makePainter(_textSpan, cursor, plainText.length, constraints.maxWidth));
+      }
     }
 
     _disposeLinePainters();
@@ -417,13 +433,12 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   /// Creates and lays out a [TextPainter] for the plain-text slice [start, end)
   /// of [span], preserving rich formatting.
   ///
-  /// IMPORTANT: layout() is called with NO maxWidth constraint.  The line text
-  /// has already been broken by Pretext; re-constraining would trigger Flutter's
-  /// own line breaker, which can produce a different break point due to shaper
-  /// rounding vs. TextPainter.maxIntrinsicWidth divergence and cause lines to
-  /// stack on top of each other.  See pretext_article_view.dart for the full
-  /// explanation.
-  TextPainter _makePainter(InlineSpan span, int start, int end) {
+  /// [maxWidth] must equal constraints.maxWidth.  Even though Pretext has
+  /// already decided the break point, we must constrain the painter — otherwise
+  /// each per-line painter lays out at double.infinity and overflows the column.
+  /// In practice the slice fits within maxWidth because Pretext measured with
+  /// the same font metrics; the constraint is purely a safety clamp.
+  TextPainter _makePainter(InlineSpan span, int start, int end, double maxWidth) {
     return TextPainter(
       text: _clipSpan(span, start, end),
       textAlign: _prototypePainter.textAlign,
@@ -431,7 +446,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
       textScaler: _prototypePainter.textScaler,
       strutStyle: _prototypePainter.strutStyle,
       locale: _prototypePainter.locale,
-    )..layout(); // unconstrained — Pretext already decided the break point
+    )..layout(maxWidth: maxWidth);
   }
 
   void _disposeLinePainters() {
@@ -447,6 +462,36 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     }
     return 0;
   }
+}
+
+// ─── Cursor advance (normalisation-aware) ─────────────────────────────────────
+//
+// Pretext normalises the text before analysis (collapses whitespace runs,
+// strips a leading/trailing space, converts \n to space in non-preWrap mode).
+// This means line.text is shorter than the corresponding slice of plainText
+// whenever normalisation removes characters.  Using line.text.length to
+// advance through plainText causes cumulative drift and wrong per-line slicing.
+//
+// Solution: walk plainText from [cursor] character-by-character, matching
+// against lineText.  When a plainText char is absent from lineText it was
+// normalised away — skip it in plainText only.  Return the new plainText
+// position after consuming all of lineText.
+
+int _advanceCursor(String plainText, int cursor, String lineText) {
+  var pi = cursor; // index into plainText
+  var li = 0;      // index into lineText
+  while (li < lineText.length && pi < plainText.length) {
+    if (lineText[li] == plainText[pi]) {
+      li++;
+      pi++;
+    } else {
+      // plainText has a character that was collapsed/stripped by normalisation
+      // (e.g. an extra space, a \n turned into a space that then got trimmed).
+      // Skip it in plainText; do NOT advance li.
+      pi++;
+    }
+  }
+  return pi;
 }
 
 // ─── TextSpan slicer ──────────────────────────────────────────────────────────
