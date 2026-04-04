@@ -412,10 +412,19 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 
   @override
   void paint(PaintingContext context, Offset offset) {
+    // Clip to the render box so that lines whose measured width is marginally
+    // wider than constraints.maxWidth (due to kerning vs. per-segment sum
+    // discrepancy between Pretext and Flutter's TextPainter) don't visually
+    // overflow into adjacent content. Painters are laid out unconstrained to
+    // prevent Flutter from re-breaking our pre-chosen line slices.
+    final canvas = context.canvas
+      ..save()
+      ..clipRect(offset & size);
     final lh = preferredLineHeight;
     for (var i = 0; i < _linePainters.length; i++) {
-      _linePainters[i].paint(context.canvas, offset + Offset(0, i * lh));
+      _linePainters[i].paint(canvas, offset + Offset(0, i * lh));
     }
+    canvas.restore();
   }
 
   @override
@@ -433,11 +442,15 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   /// Creates and lays out a [TextPainter] for the plain-text slice [start, end)
   /// of [span], preserving rich formatting.
   ///
-  /// [maxWidth] must equal constraints.maxWidth.  Even though Pretext has
-  /// already decided the break point, we must constrain the painter — otherwise
-  /// each per-line painter lays out at double.infinity and overflows the column.
-  /// In practice the slice fits within maxWidth because Pretext measured with
-  /// the same font metrics; the constraint is purely a safety clamp.
+  /// IMPORTANT: layout() is called with NO maxWidth constraint. The line text
+  /// has already been broken by Pretext. Constraining to maxWidth would cause
+  /// Flutter to re-break our pre-chosen slices whenever its full-line kerning
+  /// measurement disagrees with Pretext's per-segment sum — the re-broken
+  /// content then overlaps with the next painter and appears to "disappear".
+  ///
+  /// Instead, we paint unconstrained slices and clip the canvas to the render
+  /// box bounds in paint(). Lines that are marginally too wide (typically ≤2px
+  /// due to kerning) get clipped at the right edge rather than re-wrapped.
   TextPainter _makePainter(InlineSpan span, int start, int end, double maxWidth) {
     return TextPainter(
       text: _clipSpan(span, start, end),
@@ -446,7 +459,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
       textScaler: _prototypePainter.textScaler,
       strutStyle: _prototypePainter.strutStyle,
       locale: _prototypePainter.locale,
-    )..layout(maxWidth: maxWidth);
+    )..layout(); // unconstrained — see comment above; paint() clips to box bounds
   }
 
   void _disposeLinePainters() {
