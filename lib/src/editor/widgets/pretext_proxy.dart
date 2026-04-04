@@ -62,7 +62,12 @@ import 'dart:ui' as ui show BoxHeightStyle, BoxWidthStyle;
 import 'package:flutter/rendering.dart';
 import 'package:flutter/widgets.dart';
 import 'package:pretext_engine/pretext_engine.dart'
-    show PreparedTextWithSegments, layoutWithLines, prepareTextWithSegments;
+    show
+        InlineFlowItem,
+        InlineFlowLine,
+        PreparedInlineFlow,
+        prepareInlineFlow,
+        walkInlineFlowLines;
 
 import 'box.dart';
 
@@ -152,13 +157,16 @@ class PretextRichText extends LeafRenderObjectWidget {
 /// layout engine instead of Flutter's [RenderParagraph].
 ///
 /// Layout:
-///   1. Call [prepareTextWithSegments] (analysis + measurement).  Result is
-///      cached by object identity — only re-runs when [_textSpan] or style
-///      changes, NOT on every width-change relayout.
-///   2. Call [layoutWithLines] with the cached prepared data and the current
-///      [constraints.maxWidth].  Pure arithmetic — fast on every resize.
-///   3. Slice the rich [InlineSpan] at each [LayoutLine] boundary and build
-///      one [TextPainter] per line, laid out with NO maxWidth constraint.
+///   1. Walk the [InlineSpan] tree to produce per-span [InlineFlowItem]s.
+///      Call [prepareInlineFlow] (analysis + per-item measurement).  Result
+///      is cached — only re-runs when [_textSpan] or style changes, NOT on
+///      every width-change relayout.
+///   2. Call [walkInlineFlowLines] with the cached flow and the current
+///      [constraints.maxWidth].  Produces one [InlineFlowLine] per visual
+///      line.
+///   3. Map each line back to plain-text offsets via [_advanceCursor], then
+///      slice the rich [InlineSpan] with [_clipSpan] to build one [TextPainter]
+///      per line, laid out with NO maxWidth constraint.
 ///   4. Report size as (maxWidth, lineHeight × lineCount).
 ///
 /// Paint: paint each [TextPainter] at Offset(0, lineIndex × lineHeight).
@@ -184,17 +192,6 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
           textScaler: textScaler,
           strutStyle: strutStyle,
           locale: locale,
-        ),
-        // Line-pitch painter: "A\nA" forces a real 2-line layout so that
-        // height/2 includes the font's line gap (external leading).
-        // A single-line prototype gives only ascent+descent, which is shorter
-        // than the actual per-line pitch Flutter's RenderParagraph uses.
-        _linePitchPainter = TextPainter(
-          text: TextSpan(text: 'A\nA', style: textStyle),
-          textDirection: textDirection,
-          textScaler: textScaler,
-          strutStyle: strutStyle,
-          locale: locale,
         );
 
   // ── Fields ─────────────────────────────────────────────────────────────────
@@ -202,15 +199,10 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   InlineSpan _textSpan;
   final TextPainter _prototypePainter;
 
-  /// Two-line painter used to measure the true per-line pitch (including
-  /// inter-line leading).  Always laid out unconstrained — height is
-  /// independent of available width for a newline-separated pair.
-  final TextPainter _linePitchPainter;
-
-  /// Cached result of [prepareTextWithSegments].  Invalidated (set to null)
-  /// when [_textSpan] or any style property changes.  Only the cheap
-  /// [layoutWithLines] arithmetic re-runs on width-only changes.
-  PreparedTextWithSegments? _prepared;
+  /// Cached result of [prepareInlineFlow].  Invalidated (set to null) when
+  /// [_textSpan] or any style property changes.  Width-only relayouts reuse
+  /// this and skip the analysis + measurement phase.
+  PreparedInlineFlow? _preparedFlow;
 
   /// One painter per Pretext line, laid out at unconstrained width.
   List<TextPainter> _linePainters = [];
@@ -227,15 +219,14 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   set textSpan(InlineSpan value) {
     if (_textSpan == value) return;
     _textSpan = value;
-    _prepared = null; // text changed — must re-prepare
+    _preparedFlow = null; // text changed — must re-prepare
     markNeedsLayout();
   }
 
   set textStyle(TextStyle value) {
     if (_prototypePainter.text!.style == value) return;
     _prototypePainter.text = TextSpan(text: ' ', style: value);
-    _linePitchPainter.text = TextSpan(text: 'A\nA', style: value);
-    _prepared = null; // style affects measurement — must re-prepare
+    _preparedFlow = null; // style affects measurement — must re-prepare
     markNeedsLayout();
   }
 
@@ -248,30 +239,26 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   set textDirection(TextDirection value) {
     if (_prototypePainter.textDirection == value) return;
     _prototypePainter.textDirection = value;
-    _linePitchPainter.textDirection = value;
     markNeedsLayout();
   }
 
   set textScaler(TextScaler value) {
     if (_prototypePainter.textScaler == value) return;
     _prototypePainter.textScaler = value;
-    _linePitchPainter.textScaler = value;
-    _prepared = null; // scaler affects measurement
+    _preparedFlow = null; // scaler affects measurement
     markNeedsLayout();
   }
 
   set strutStyle(StrutStyle value) {
     if (_prototypePainter.strutStyle == value) return;
     _prototypePainter.strutStyle = value;
-    _linePitchPainter.strutStyle = value;
     markNeedsLayout();
   }
 
   set locale(Locale value) {
     if (_prototypePainter.locale == value) return;
     _prototypePainter.locale = value;
-    _linePitchPainter.locale = value;
-    _prepared = null; // locale can affect font selection and metrics
+    _preparedFlow = null; // locale can affect font selection and metrics
     markNeedsLayout();
   }
 
@@ -279,17 +266,8 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 
   @override
   double get preferredLineHeight {
-    // Use the two-line pitch painter so the returned height includes the
-    // font's line gap (external leading) — matching RenderParagraph's actual
-    // per-line pitch.  A single-line prototype gives only ascent+descent and
-    // would produce tighter spacing than vanilla Quill.
-    //
-    // layout() is called here because preferredLineHeight can be queried
-    // before performLayout (e.g. for block sizing hints in the editor).
-    if (!_linePitchPainter.debugDisposed) {
-      _linePitchPainter.layout();
-    }
-    return _linePitchPainter.height / 2;
+    _prototypePainter.layout();
+    return _prototypePainter.preferredLineHeight;
   }
 
   @override
@@ -368,17 +346,10 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 
   @override
   void performLayout() {
-    // 1. Layout painters to get the authoritative line height.
-    //    _prototypePainter: used for textAlign/direction propagation to child
-    //      painters and for the external preferredLineHeight API.
-    //    _linePitchPainter: "A\nA" — height/2 gives the true per-line pitch
-    //      including inter-line leading, matching RenderParagraph's spacing.
     _prototypePainter.layout(
         minWidth: constraints.minWidth, maxWidth: constraints.maxWidth);
-    _linePitchPainter.layout();
-    final lh = _linePitchPainter.height / 2;
+    final lh = _prototypePainter.preferredLineHeight;
 
-    // 2. Extract plain text.
     final plainText = _textSpan.toPlainText(includeSemanticsLabels: false);
     _totalLength = plainText.length;
 
@@ -390,83 +361,74 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
       return;
     }
 
-    // 3. Prepare text (analysis + measurement) — cached until text/style changes.
-    //    Only the pure-arithmetic layoutWithLines() re-runs on width changes.
-    //
-    //    textScaler is passed so Pretext measures glyphs at the same effective
-    //    size as the rendering painters.  Without it, any device text-scale
-    //    factor != 1.0 causes systematic overflow (Pretext under-estimates line
-    //    widths, so more text is placed on a line than Flutter can actually fit).
-    final style = (_textSpan is TextSpan)
-        ? ((_textSpan as TextSpan).style ?? const TextStyle())
-        : const TextStyle();
-    _prepared ??= prepareTextWithSegments(
-      plainText,
-      style,
-      textScaler: _prototypePainter.textScaler,
-    );
+    // Prepare InlineFlow (analysis + per-item measurement) — cached until
+    // text/style/scaler changes.  Width-only relayouts skip this phase.
+    if (_preparedFlow == null) {
+      final richItems = _extractRichItems(_textSpan);
+      _preparedFlow = prepareInlineFlow(
+        richItems
+            .map((r) => InlineFlowItem(text: r.text, style: r.style))
+            .toList(),
+        textScaler: _prototypePainter.textScaler,
+      );
+    }
 
-    // 4. Run the Pretext line-breaking algorithm for the current column width.
-    final result = layoutWithLines(_prepared!, constraints.maxWidth, lh);
-
-    // 5. Build one TextPainter per Pretext line by slicing the rich InlineSpan.
-    //
-    // CURSOR DRIFT FIX: _advanceCursor() matches line.text char-by-char
-    // against plainText so normalisation-removed chars (extra spaces, trailing
-    // \n) don't accumulate as positional drift.
-    //
-    // OVERFLOW FIX: Pretext measures all segments using the BASE TextStyle.
-    // Bold/italic/sized inline spans render wider than measured — the painter's
-    // maxIntrinsicWidth may exceed constraints.maxWidth even though Pretext
-    // said the line fits.  After computing each tentative endpoint we verify
-    // the actual rich-text width and trim backward word-by-word when needed.
-    // Trimmed words spill into the next painter via _advanceCursor which
-    // naturally treats unmatched plainText chars as normalisation artefacts.
+    // Walk InlineFlow lines and build one TextPainter per line via _clipSpan.
+    // _advanceCursor maps collapsed-whitespace line text back to plainText
+    // positions so _clipSpan receives correct rich-span boundaries.
     final newPainters = <TextPainter>[];
     final newStarts = <int>[];
-    var pretextIdx = 0;
     var cursor = 0;
 
-    while (cursor < plainText.length) {
-      // Determine tentative endpoint from Pretext or fall back to end-of-text.
-      int tentativeEnd;
-      if (pretextIdx < result.lines.length) {
-        tentativeEnd =
-            _advanceCursor(plainText, cursor, result.lines[pretextIdx].text);
-        pretextIdx++;
-      } else {
-        // Pretext lines exhausted — remaining text is overflow from trimming.
-        final remaining = plainText.substring(cursor);
-        if (remaining.trim().isEmpty) break; // only normalisation artefacts
-        tentativeEnd = plainText.length;
+    walkInlineFlowLines(_preparedFlow!, constraints.maxWidth, (line) {
+      // Reconstruct the line's text for cursor mapping.
+      // InlineFlow collapses inter-item whitespace to a single space (gapBefore).
+      final lineBuf = StringBuffer();
+      for (var fi = 0; fi < line.fragments.length; fi++) {
+        if (fi > 0 && line.fragments[fi].gapBefore > 0) lineBuf.write(' ');
+        lineBuf.write(line.fragments[fi].text);
       }
+      final lineText = lineBuf.toString();
+      if (lineText.isEmpty) return;
 
-      if (tentativeEnd <= cursor) continue; // degenerate/empty — skip
+      final tentativeEnd = _advanceCursor(plainText, cursor, lineText);
+      if (tentativeEnd <= cursor) return;
 
-      // Skip leading spaces so each line begins at the first word character.
-      // Trimming the previous line leaves cursor just before a space separator.
+      // Skip leading spaces that InlineFlow collapsed away.
       var lineStart = cursor;
       while (lineStart < tentativeEnd && plainText[lineStart] == ' ') {
         lineStart++;
       }
       if (lineStart >= tentativeEnd) {
         cursor = tentativeEnd;
-        continue;
+        return;
       }
 
-      // Verify the rich-text slice fits and trim backward if not.
-      final (:start, :end, :painter) =
-          _fitSlice(plainText, lineStart, tentativeEnd, constraints.maxWidth);
-      newStarts.add(start);
-      newPainters.add(painter);
-      cursor = end;
+      newStarts.add(lineStart);
+      newPainters.add(
+          _makePainter(_textSpan, lineStart, tentativeEnd, constraints.maxWidth));
+      cursor = tentativeEnd;
+    });
+
+    // Flush any remaining non-whitespace text (e.g. after a hard-break).
+    if (cursor < plainText.length &&
+        plainText.substring(cursor).trim().isNotEmpty) {
+      var lineStart = cursor;
+      while (lineStart < plainText.length && plainText[lineStart] == ' ') {
+        lineStart++;
+      }
+      if (lineStart < plainText.length) {
+        newStarts.add(lineStart);
+        newPainters.add(_makePainter(
+            _textSpan, lineStart, plainText.length, constraints.maxWidth));
+      }
     }
 
     _disposeLinePainters();
     _linePainters = newPainters;
     _lineStartOffsets = newStarts;
 
-    final totalH = lh * _linePainters.length;
+    final totalH = lh * (_linePainters.isEmpty ? 1 : _linePainters.length);
     size = constraints.constrain(Size(constraints.maxWidth, totalH));
   }
 
@@ -494,7 +456,6 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   void dispose() {
     _disposeLinePainters();
     _prototypePainter.dispose();
-    _linePitchPainter.dispose();
     super.dispose();
   }
 
@@ -516,50 +477,6 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     )..layout(); // unconstrained — paint() clips to box bounds
   }
 
-  /// Returns the tightest-fitting slice of [_textSpan] starting at [lineStart]
-  /// whose [TextPainter.maxIntrinsicWidth] ≤ [maxWidth].
-  ///
-  /// Pretext's base-style measurements can under-estimate the width of rich
-  /// spans (bold, italic, larger sub-sizes).  This method verifies the actual
-  /// rendered width and trims backward word-by-word until the slice fits.
-  ///
-  /// The returned [end] is always > [lineStart] (or equals [tentativeEnd] when
-  /// no word-boundary trim was possible — a single word wider than the column).
-  /// In that fallback the painter will be canvas-clipped by [paint()].
-  ({int start, int end, TextPainter painter}) _fitSlice(
-    String plainText,
-    int lineStart,
-    int tentativeEnd,
-    double maxWidth,
-  ) {
-    final end = tentativeEnd;
-    final painter = _makePainter(_textSpan, lineStart, end, maxWidth);
-
-    if (painter.maxIntrinsicWidth <= maxWidth) {
-      return (start: lineStart, end: end, painter: painter);
-    }
-
-    // Trim backward word-by-word until the rich-text slice fits.
-    var trimEnd = end;
-    while (trimEnd > lineStart) {
-      // Skip trailing spaces → end of last word → skip space before that word.
-      while (trimEnd > lineStart && plainText[trimEnd - 1] == ' ') { trimEnd--; }
-      while (trimEnd > lineStart && plainText[trimEnd - 1] != ' ') { trimEnd--; }
-      while (trimEnd > lineStart && plainText[trimEnd - 1] == ' ') { trimEnd--; }
-      if (trimEnd <= lineStart) break;
-
-      final testPainter = _makePainter(_textSpan, lineStart, trimEnd, maxWidth);
-      if (testPainter.maxIntrinsicWidth <= maxWidth) {
-        painter.dispose();
-        return (start: lineStart, end: trimEnd, painter: testPainter);
-      }
-      testPainter.dispose();
-    }
-
-    // Fallback: single word wider than column — canvas-clip will handle it.
-    return (start: lineStart, end: end, painter: painter);
-  }
-
   void _disposeLinePainters() {
     for (final p in _linePainters) {
       p.dispose();
@@ -573,6 +490,31 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     }
     return 0;
   }
+}
+
+// ─── InlineFlow helpers ───────────────────────────────────────────────────────
+
+class _RichItem {
+  const _RichItem(this.text, this.style);
+  final String text;
+  final TextStyle style;
+}
+
+List<_RichItem> _extractRichItems(InlineSpan root) {
+  final items = <_RichItem>[];
+  void walk(InlineSpan span, TextStyle inherited) {
+    if (span is TextSpan) {
+      final effective = inherited.merge(span.style ?? const TextStyle());
+      if ((span.text ?? '').isNotEmpty) items.add(_RichItem(span.text!, effective));
+      for (final child in span.children ?? const <InlineSpan>[]) {
+        walk(child, effective);
+      }
+    } else if (span is WidgetSpan) {
+      items.add(_RichItem('\uFFFC', inherited));
+    }
+  }
+  walk(root, const TextStyle());
+  return items;
 }
 
 // ─── Cursor advance (normalisation-aware) ─────────────────────────────────────
