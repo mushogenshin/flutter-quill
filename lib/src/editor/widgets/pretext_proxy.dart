@@ -381,34 +381,55 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 
     // 5. Build one TextPainter per Pretext line by slicing the rich InlineSpan.
     //
-    // CURSOR DRIFT FIX: line.text is built from Pretext's *normalised* text
-    // (whitespace collapsed, trailing \n stripped), but plainText is the raw
-    // toPlainText() output which may be longer.  Using line.text.length to
-    // advance through plainText causes cumulative drift that manifests as
-    // mid-word splits (e.g. "connec" + "t").
+    // CURSOR DRIFT FIX: _advanceCursor() matches line.text char-by-char
+    // against plainText so normalisation-removed chars (extra spaces, trailing
+    // \n) don't accumulate as positional drift.
     //
-    // Instead we use _advanceCursor(), which walks plainText character-by-
-    // character matching against line.text and skips chars that were removed
-    // by normalisation (extra spaces, collapsed \n, etc.).
+    // OVERFLOW FIX: Pretext measures all segments using the BASE TextStyle.
+    // Bold/italic/sized inline spans render wider than measured — the painter's
+    // maxIntrinsicWidth may exceed constraints.maxWidth even though Pretext
+    // said the line fits.  After computing each tentative endpoint we verify
+    // the actual rich-text width and trim backward word-by-word when needed.
+    // Trimmed words spill into the next painter via _advanceCursor which
+    // naturally treats unmatched plainText chars as normalisation artefacts.
     final newPainters = <TextPainter>[];
     final newStarts = <int>[];
+    var pretextIdx = 0;
     var cursor = 0;
-    for (final line in result.lines) {
-      newStarts.add(cursor);
-      final end = _advanceCursor(plainText, cursor, line.text);
-      newPainters.add(_makePainter(_textSpan, cursor, end, constraints.maxWidth));
-      cursor = end;
-    }
-    // Safety: consume any remaining plainText not covered by Pretext lines
-    // (typically the trailing \n that normalisation strips from Quill paragraphs).
-    // Skip whitespace-only remainders — they are normalisation artifacts and
-    // should not produce an extra visible line.
-    if (cursor < plainText.length) {
-      final remainder = plainText.substring(cursor);
-      if (remainder.trim().isNotEmpty) {
-        newStarts.add(cursor);
-        newPainters.add(_makePainter(_textSpan, cursor, plainText.length, constraints.maxWidth));
+
+    while (cursor < plainText.length) {
+      // Determine tentative endpoint from Pretext or fall back to end-of-text.
+      int tentativeEnd;
+      if (pretextIdx < result.lines.length) {
+        tentativeEnd =
+            _advanceCursor(plainText, cursor, result.lines[pretextIdx].text);
+        pretextIdx++;
+      } else {
+        // Pretext lines exhausted — remaining text is overflow from trimming.
+        final remaining = plainText.substring(cursor);
+        if (remaining.trim().isEmpty) break; // only normalisation artefacts
+        tentativeEnd = plainText.length;
       }
+
+      if (tentativeEnd <= cursor) continue; // degenerate/empty — skip
+
+      // Skip leading spaces so each line begins at the first word character.
+      // Trimming the previous line leaves cursor just before a space separator.
+      var lineStart = cursor;
+      while (lineStart < tentativeEnd && plainText[lineStart] == ' ') {
+        lineStart++;
+      }
+      if (lineStart >= tentativeEnd) {
+        cursor = tentativeEnd;
+        continue;
+      }
+
+      // Verify the rich-text slice fits and trim backward if not.
+      final (:start, :end, :painter) =
+          _fitSlice(plainText, lineStart, tentativeEnd, constraints.maxWidth);
+      newStarts.add(start);
+      newPainters.add(painter);
+      cursor = end;
     }
 
     _disposeLinePainters();
@@ -449,17 +470,10 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   /// Creates and lays out a [TextPainter] for the plain-text slice [start, end)
-  /// of [span], preserving rich formatting.
-  ///
-  /// IMPORTANT: layout() is called with NO maxWidth constraint. The line text
-  /// has already been broken by Pretext. Constraining to maxWidth would cause
-  /// Flutter to re-break our pre-chosen slices whenever its full-line kerning
-  /// measurement disagrees with Pretext's per-segment sum — the re-broken
-  /// content then overlaps with the next painter and appears to "disappear".
-  ///
-  /// Instead, we paint unconstrained slices and clip the canvas to the render
-  /// box bounds in paint(). Lines that are marginally too wide (typically ≤2px
-  /// due to kerning) get clipped at the right edge rather than re-wrapped.
+  /// of [span], preserving rich formatting.  Layout is unconstrained so Flutter
+  /// does not re-break our pre-chosen slice; [paint()] canvas-clips to the
+  /// render-box bounds for the rare case where a single word is wider than the
+  /// column.
   TextPainter _makePainter(InlineSpan span, int start, int end, double maxWidth) {
     return TextPainter(
       text: _clipSpan(span, start, end),
@@ -468,7 +482,51 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
       textScaler: _prototypePainter.textScaler,
       strutStyle: _prototypePainter.strutStyle,
       locale: _prototypePainter.locale,
-    )..layout(); // unconstrained — see comment above; paint() clips to box bounds
+    )..layout(); // unconstrained — paint() clips to box bounds
+  }
+
+  /// Returns the tightest-fitting slice of [_textSpan] starting at [lineStart]
+  /// whose [TextPainter.maxIntrinsicWidth] ≤ [maxWidth].
+  ///
+  /// Pretext's base-style measurements can under-estimate the width of rich
+  /// spans (bold, italic, larger sub-sizes).  This method verifies the actual
+  /// rendered width and trims backward word-by-word until the slice fits.
+  ///
+  /// The returned [end] is always > [lineStart] (or equals [tentativeEnd] when
+  /// no word-boundary trim was possible — a single word wider than the column).
+  /// In that fallback the painter will be canvas-clipped by [paint()].
+  ({int start, int end, TextPainter painter}) _fitSlice(
+    String plainText,
+    int lineStart,
+    int tentativeEnd,
+    double maxWidth,
+  ) {
+    final end = tentativeEnd;
+    final painter = _makePainter(_textSpan, lineStart, end, maxWidth);
+
+    if (painter.maxIntrinsicWidth <= maxWidth) {
+      return (start: lineStart, end: end, painter: painter);
+    }
+
+    // Trim backward word-by-word until the rich-text slice fits.
+    var trimEnd = end;
+    while (trimEnd > lineStart) {
+      // Skip trailing spaces → end of last word → skip space before that word.
+      while (trimEnd > lineStart && plainText[trimEnd - 1] == ' ') { trimEnd--; }
+      while (trimEnd > lineStart && plainText[trimEnd - 1] != ' ') { trimEnd--; }
+      while (trimEnd > lineStart && plainText[trimEnd - 1] == ' ') { trimEnd--; }
+      if (trimEnd <= lineStart) break;
+
+      final testPainter = _makePainter(_textSpan, lineStart, trimEnd, maxWidth);
+      if (testPainter.maxIntrinsicWidth <= maxWidth) {
+        painter.dispose();
+        return (start: lineStart, end: trimEnd, painter: testPainter);
+      }
+      testPainter.dispose();
+    }
+
+    // Fallback: single word wider than column — canvas-clip will handle it.
+    return (start: lineStart, end: end, painter: painter);
   }
 
   void _disposeLinePainters() {
