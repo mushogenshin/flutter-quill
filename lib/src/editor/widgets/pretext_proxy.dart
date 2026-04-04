@@ -48,7 +48,6 @@ import 'dart:ui' as ui show BoxHeightStyle, BoxWidthStyle;
 
 import 'package:flutter/rendering.dart';
 import 'package:flutter/widgets.dart';
-
 import 'box.dart';
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -74,9 +73,9 @@ typedef PretextLineBreaker = List<int> Function(
 /// rendering path; otherwise it falls back to the original [RichText] path.
 class PretextLineBreakerScope extends InheritedWidget {
   const PretextLineBreakerScope({
-    super.key,
     required this.lineBreaker,
     required super.child,
+    super.key,
   });
 
   final PretextLineBreaker lineBreaker;
@@ -102,7 +101,6 @@ class PretextLineBreakerScope extends InheritedWidget {
 /// lines end and paints each line with its own [TextPainter].
 class PretextRichText extends LeafRenderObjectWidget {
   const PretextRichText({
-    super.key,
     required this.textSpan,
     required this.textStyle,
     required this.textAlign,
@@ -111,6 +109,7 @@ class PretextRichText extends LeafRenderObjectWidget {
     required this.locale,
     required this.textScaler,
     required this.lineBreaker,
+    super.key,
   });
 
   final InlineSpan textSpan;
@@ -265,7 +264,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     // Use the prototype painter — layout() is called inside performLayout,
     // but preferredLineHeight is also queried before layout for sizing hints.
     // The prototype painter is always kept in sync with the current style.
-    if (!_prototypePainter.debugDisposed!) {
+    if (!_prototypePainter.debugDisposed) {
       _prototypePainter.layout();
     }
     return _prototypePainter.preferredLineHeight;
@@ -468,7 +467,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 InlineSpan _clipSpan(InlineSpan root, int start, int end) {
   var offset = 0; // mutable cursor shared across the recursive walk
 
-  InlineSpan? _clip(InlineSpan span) {
+  InlineSpan? clip(InlineSpan span) {
     if (span is TextSpan) {
       final text = span.text ?? '';
       final spanTextStart = offset;
@@ -488,7 +487,7 @@ InlineSpan _clipSpan(InlineSpan root, int start, int end) {
       if (span.children != null) {
         final childResults = <InlineSpan>[];
         for (final child in span.children!) {
-          final clipped = _clip(child);
+          final clipped = clip(child);
           if (clipped != null) childResults.add(clipped);
         }
         clippedChildren = childResults.isEmpty ? null : childResults;
@@ -515,5 +514,5 @@ InlineSpan _clipSpan(InlineSpan root, int start, int end) {
     return null;
   }
 
-  return _clip(root) ?? TextSpan(style: (root is TextSpan) ? root.style : null);
+  return clip(root) ?? TextSpan(style: (root is TextSpan) ? root.style : null);
 }
