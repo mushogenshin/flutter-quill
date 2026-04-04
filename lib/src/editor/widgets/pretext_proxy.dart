@@ -175,11 +175,22 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     required Locale locale,
     required TextScaler textScaler,
   })  : _textSpan = textSpan,
-        // Prototype painter: measures a single space to derive preferredLineHeight
-        // without running a full layout — same technique as RenderParagraphProxy.
+        // Prototype painter: single space — used for textAlign/textDirection
+        // propagation and the external preferredLineHeight API (cursor sizing).
         _prototypePainter = TextPainter(
           text: TextSpan(text: ' ', style: textStyle),
           textAlign: textAlign,
+          textDirection: textDirection,
+          textScaler: textScaler,
+          strutStyle: strutStyle,
+          locale: locale,
+        ),
+        // Line-pitch painter: "A\nA" forces a real 2-line layout so that
+        // height/2 includes the font's line gap (external leading).
+        // A single-line prototype gives only ascent+descent, which is shorter
+        // than the actual per-line pitch Flutter's RenderParagraph uses.
+        _linePitchPainter = TextPainter(
+          text: TextSpan(text: 'A\nA', style: textStyle),
           textDirection: textDirection,
           textScaler: textScaler,
           strutStyle: strutStyle,
@@ -190,6 +201,11 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 
   InlineSpan _textSpan;
   final TextPainter _prototypePainter;
+
+  /// Two-line painter used to measure the true per-line pitch (including
+  /// inter-line leading).  Always laid out unconstrained — height is
+  /// independent of available width for a newline-separated pair.
+  final TextPainter _linePitchPainter;
 
   /// Cached result of [prepareTextWithSegments].  Invalidated (set to null)
   /// when [_textSpan] or any style property changes.  Only the cheap
@@ -218,6 +234,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   set textStyle(TextStyle value) {
     if (_prototypePainter.text!.style == value) return;
     _prototypePainter.text = TextSpan(text: ' ', style: value);
+    _linePitchPainter.text = TextSpan(text: 'A\nA', style: value);
     _prepared = null; // style affects measurement — must re-prepare
     markNeedsLayout();
   }
@@ -231,12 +248,14 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   set textDirection(TextDirection value) {
     if (_prototypePainter.textDirection == value) return;
     _prototypePainter.textDirection = value;
+    _linePitchPainter.textDirection = value;
     markNeedsLayout();
   }
 
   set textScaler(TextScaler value) {
     if (_prototypePainter.textScaler == value) return;
     _prototypePainter.textScaler = value;
+    _linePitchPainter.textScaler = value;
     _prepared = null; // scaler affects measurement
     markNeedsLayout();
   }
@@ -244,12 +263,14 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   set strutStyle(StrutStyle value) {
     if (_prototypePainter.strutStyle == value) return;
     _prototypePainter.strutStyle = value;
+    _linePitchPainter.strutStyle = value;
     markNeedsLayout();
   }
 
   set locale(Locale value) {
     if (_prototypePainter.locale == value) return;
     _prototypePainter.locale = value;
+    _linePitchPainter.locale = value;
     _prepared = null; // locale can affect font selection and metrics
     markNeedsLayout();
   }
@@ -258,13 +279,17 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 
   @override
   double get preferredLineHeight {
-    // The prototype painter is always kept in sync with the current style.
-    // We must call layout() here because preferredLineHeight is queried before
-    // performLayout (e.g. for block sizing hints).
-    if (!_prototypePainter.debugDisposed) {
-      _prototypePainter.layout();
+    // Use the two-line pitch painter so the returned height includes the
+    // font's line gap (external leading) — matching RenderParagraph's actual
+    // per-line pitch.  A single-line prototype gives only ascent+descent and
+    // would produce tighter spacing than vanilla Quill.
+    //
+    // layout() is called here because preferredLineHeight can be queried
+    // before performLayout (e.g. for block sizing hints in the editor).
+    if (!_linePitchPainter.debugDisposed) {
+      _linePitchPainter.layout();
     }
-    return _prototypePainter.preferredLineHeight;
+    return _linePitchPainter.height / 2;
   }
 
   @override
@@ -343,10 +368,15 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
 
   @override
   void performLayout() {
-    // 1. Layout prototype to get the authoritative line height.
+    // 1. Layout painters to get the authoritative line height.
+    //    _prototypePainter: used for textAlign/direction propagation to child
+    //      painters and for the external preferredLineHeight API.
+    //    _linePitchPainter: "A\nA" — height/2 gives the true per-line pitch
+    //      including inter-line leading, matching RenderParagraph's spacing.
     _prototypePainter.layout(
         minWidth: constraints.minWidth, maxWidth: constraints.maxWidth);
-    final lh = _prototypePainter.preferredLineHeight;
+    _linePitchPainter.layout();
+    final lh = _linePitchPainter.height / 2;
 
     // 2. Extract plain text.
     final plainText = _textSpan.toPlainText(includeSemanticsLabels: false);
@@ -464,6 +494,7 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   void dispose() {
     _disposeLinePainters();
     _prototypePainter.dispose();
+    _linePitchPainter.dispose();
     super.dispose();
   }
 
