@@ -477,26 +477,27 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     // Extending to the next content start includes the stripped chars so every
     // plainText offset resolves to a distinct caret position.
     //
-    // _lineStartOffsets[0] is always 0 — line 0 owns any leading whitespace
-    // that InlineFlow stripped.  For all other lines, ownership starts where
-    // the previous line's painter ends (= this line's content start).
-    // _linePainterStarts[i] records where the painter actually begins (content
-    // start), so cursor arithmetic never produces a negative localOffset.
+    // Build painters.  For line 0 the painter starts at 0 (not contentStart),
+    // so any leading whitespace InlineFlow stripped is still owned by the
+    // painter.  This means cursor arithmetic (localOffset = position - lineStart)
+    // is always non-negative: a cursor placed before stripped content (e.g.
+    // right after a paragraph split that left " def" with offset 0 pointing
+    // before the space) resolves correctly instead of producing localOffset=-1
+    // which TextPainter interprets as end-of-text.
+    // For all other lines contentStart == ownershipStart, so no adjustment needed.
     final newPainters = <TextPainter>[];
     final newOwnershipStarts = <int>[];
-    final newPainterStarts = <int>[];
     for (var i = 0; i < newStarts.length; i++) {
-      final painterStart = newStarts[i];
+      final painterStart = i == 0 ? 0 : newStarts[i];
       final painterEnd = i + 1 < newStarts.length ? newStarts[i + 1] : plainText.length;
-      newOwnershipStarts.add(i == 0 ? 0 : painterStart);
-      newPainterStarts.add(painterStart);
+      newOwnershipStarts.add(painterStart);
       newPainters.add(_makePainter(_textSpan, painterStart, painterEnd, constraints.maxWidth));
     }
 
     _disposeLinePainters();
     _linePainters = newPainters;
     _lineStartOffsets = newOwnershipStarts;
-    _linePainterStarts = newPainterStarts;
+    _linePainterStarts = newOwnershipStarts; // identical — kept for API consistency
 
     final totalH = lh * (_linePainters.isEmpty ? 1 : _linePainters.length);
     size = constraints.constrain(Size(constraints.maxWidth, totalH));
