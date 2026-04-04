@@ -63,12 +63,13 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/widgets.dart';
 import 'package:pretext_engine/pretext_engine.dart'
     show
+        InlineFlowFragmentRange,
         InlineFlowItem,
-        InlineFlowLine,
+        LayoutCursor,
         PreparedInlineFlow,
         countInlineFlowLines,
         prepareInlineFlow,
-        walkInlineFlowLines;
+        walkInlineFlowLineRanges;
 
 import 'box.dart';
 
@@ -204,6 +205,19 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
   /// [_textSpan] or any style property changes.  Width-only relayouts reuse
   /// this and skip the analysis + measurement phase.
   PreparedInlineFlow? _preparedFlow;
+
+  /// Flat list of styled runs extracted from [_textSpan].  Rebuilt whenever
+  /// [_preparedFlow] is rebuilt.  Used to map [InlineFlowFragmentRange]
+  /// item indices back to plain-text offsets.
+  List<_RichItem> _richItems = [];
+
+  /// UTF-16 offset into plainText where [_richItems[i]] starts.
+  List<int> _itemStart = [];
+
+  /// UTF-16 offset into plainText where [_richItems[i]]'s content starts —
+  /// i.e. [_itemStart[i]] + the length of leading collapsible whitespace
+  /// stripped by [prepareInlineFlow].
+  List<int> _itemContentStart = [];
 
   /// One painter per Pretext line, laid out at unconstrained width.
   List<TextPainter> _linePainters = [];
@@ -401,65 +415,50 @@ class RenderPretextLine extends RenderBox implements RenderContentProxyBox {
     // Prepare InlineFlow (analysis + per-item measurement) — cached until
     // text/style/scaler changes.  Width-only relayouts skip this phase.
     if (_preparedFlow == null) {
-      final richItems = _extractRichItems(_textSpan);
+      _richItems = _extractRichItems(_textSpan);
+      var offset = 0;
+      _itemStart = List<int>.filled(_richItems.length, 0);
+      _itemContentStart = List<int>.filled(_richItems.length, 0);
+      for (var i = 0; i < _richItems.length; i++) {
+        _itemStart[i] = offset;
+        final match = _leadingSpaceRe.firstMatch(_richItems[i].text);
+        _itemContentStart[i] = offset + (match?.end ?? 0);
+        offset += _richItems[i].text.length;
+      }
       _preparedFlow = prepareInlineFlow(
-        richItems
+        _richItems
             .map((r) => InlineFlowItem(text: r.text, style: r.style))
             .toList(),
         textScaler: _prototypePainter.textScaler,
       );
     }
 
-    // Walk InlineFlow lines and build one TextPainter per line via _clipSpan.
-    // _advanceCursor maps collapsed-whitespace line text back to plainText
-    // positions so _clipSpan receives correct rich-span boundaries.
+    // Walk InlineFlow line ranges and build one TextPainter per line via
+    // _clipSpan.  Each InlineFlowFragmentRange carries itemIndex + start/end
+    // LayoutCursors; _itemContentStart[] + _cursorToUtf16() convert those
+    // directly to UTF-16 offsets in plainText — no text materialisation or
+    // fuzzy string matching needed.
     final newPainters = <TextPainter>[];
     final newStarts = <int>[];
-    var cursor = 0;
 
-    walkInlineFlowLines(_preparedFlow!, constraints.maxWidth, (line) {
-      // Reconstruct the line's text for cursor mapping.
-      // InlineFlow collapses inter-item whitespace to a single space (gapBefore).
-      final lineBuf = StringBuffer();
-      for (var fi = 0; fi < line.fragments.length; fi++) {
-        if (fi > 0 && line.fragments[fi].gapBefore > 0) lineBuf.write(' ');
-        lineBuf.write(line.fragments[fi].text);
-      }
-      final lineText = lineBuf.toString();
-      if (lineText.isEmpty) return;
+    walkInlineFlowLineRanges(_preparedFlow!, constraints.maxWidth, (line) {
+      if (line.fragments.isEmpty) return;
+      final firstFrag = line.fragments.first;
+      final lastFrag = line.fragments.last;
 
-      final tentativeEnd = _advanceCursor(plainText, cursor, lineText);
-      if (tentativeEnd <= cursor) return;
+      final firstSegs = _preparedFlow!.segmentsForItem(firstFrag.itemIndex)!;
+      final lineStart = _itemContentStart[firstFrag.itemIndex]
+          + _cursorToUtf16(firstSegs, firstFrag.start);
 
-      // Skip leading spaces that InlineFlow collapsed away.
-      var lineStart = cursor;
-      while (lineStart < tentativeEnd && plainText[lineStart] == ' ') {
-        lineStart++;
-      }
-      if (lineStart >= tentativeEnd) {
-        cursor = tentativeEnd;
-        return;
-      }
+      final lastSegs = _preparedFlow!.segmentsForItem(lastFrag.itemIndex)!;
+      final lineEnd = _itemContentStart[lastFrag.itemIndex]
+          + _cursorToUtf16(lastSegs, lastFrag.end);
 
+      if (lineEnd <= lineStart) return;
       newStarts.add(lineStart);
       newPainters.add(
-          _makePainter(_textSpan, lineStart, tentativeEnd, constraints.maxWidth));
-      cursor = tentativeEnd;
+          _makePainter(_textSpan, lineStart, lineEnd, constraints.maxWidth));
     });
-
-    // Flush any remaining non-whitespace text (e.g. after a hard-break).
-    if (cursor < plainText.length &&
-        plainText.substring(cursor).trim().isNotEmpty) {
-      var lineStart = cursor;
-      while (lineStart < plainText.length && plainText[lineStart] == ' ') {
-        lineStart++;
-      }
-      if (lineStart < plainText.length) {
-        newStarts.add(lineStart);
-        newPainters.add(_makePainter(
-            _textSpan, lineStart, plainText.length, constraints.maxWidth));
-      }
-    }
 
     _disposeLinePainters();
     _linePainters = newPainters;
@@ -554,34 +553,49 @@ List<_RichItem> _extractRichItems(InlineSpan root) {
   return items;
 }
 
-// ─── Cursor advance (normalisation-aware) ─────────────────────────────────────
-//
-// Pretext normalises the text before analysis (collapses whitespace runs,
-// strips a leading/trailing space, converts \n to space in non-preWrap mode).
-// This means line.text is shorter than the corresponding slice of plainText
-// whenever normalisation removes characters.  Using line.text.length to
-// advance through plainText causes cumulative drift and wrong per-line slicing.
-//
-// Solution: walk plainText from [cursor] character-by-character, matching
-// against lineText.  When a plainText char is absent from lineText it was
-// normalised away — skip it in plainText only.  Return the new plainText
-// position after consuming all of lineText.
+// ─── InlineFlow offset helpers ────────────────────────────────────────────────
 
+// Same whitespace pattern used by prepareInlineFlow to strip item leading text.
+final _leadingSpaceRe = RegExp(r'^[ \t\n\f\r]+');
+
+// Preserved for test use via [advanceCursorForTest] — no longer called from
+// production code since the walkInlineFlowLineRanges path computes offsets
+// directly from [_itemContentStart] + [_cursorToUtf16].
 int _advanceCursor(String plainText, int cursor, String lineText) {
-  var pi = cursor; // index into plainText
-  var li = 0;      // index into lineText
+  var pi = cursor;
+  var li = 0;
   while (li < lineText.length && pi < plainText.length) {
     if (lineText[li] == plainText[pi]) {
       li++;
       pi++;
     } else {
-      // plainText has a character that was collapsed/stripped by normalisation
-      // (e.g. an extra space, a \n turned into a space that then got trimmed).
-      // Skip it in plainText; do NOT advance li.
       pi++;
     }
   }
   return pi;
+}
+
+/// Converts a [LayoutCursor] within [segments] to a UTF-16 code-unit offset.
+///
+/// [cursor.segmentIndex] selects the segment; [cursor.graphemeIndex] counts
+/// Unicode code points (runes) into that segment — NOT UTF-16 code units.
+/// This function accumulates full segment lengths (in UTF-16) for segments
+/// before [cursor.segmentIndex], then walks runes for the partial segment.
+int _cursorToUtf16(List<String> segments, LayoutCursor cursor) {
+  var offset = 0;
+  for (var si = 0; si < cursor.segmentIndex && si < segments.length; si++) {
+    offset += segments[si].length;
+  }
+  if (cursor.segmentIndex < segments.length) {
+    final seg = segments[cursor.segmentIndex];
+    var gi = 0;
+    for (final rune in seg.runes) {
+      if (gi >= cursor.graphemeIndex) break;
+      offset += rune > 0xFFFF ? 2 : 1;
+      gi++;
+    }
+  }
+  return offset;
 }
 
 // ─── TextSpan slicer ──────────────────────────────────────────────────────────
