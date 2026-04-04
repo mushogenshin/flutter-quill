@@ -565,3 +565,19 @@ InlineSpan _clipSpan(InlineSpan root, int start, int end) {
 
   return clip(root) ?? TextSpan(style: (root is TextSpan) ? root.style : null);
 }
+
+// ─── Test-visible wrappers ────────────────────────────────────────────────────
+//
+// _clipSpan and _advanceCursor are package-private top-level functions.
+// These thin wrappers expose them under stable names for unit tests so tests
+// can import this file directly without relying on name-mangling hacks.
+
+/// Test-only alias for [_clipSpan]. Do not call from production code.
+@visibleForTesting
+InlineSpan clipSpanForTest(InlineSpan root, int start, int end) =>
+    _clipSpan(root, start, end);
+
+/// Test-only alias for [_advanceCursor]. Do not call from production code.
+@visibleForTesting
+int advanceCursorForTest(String plainText, int cursor, String lineText) =>
+    _advanceCursor(plainText, cursor, lineText);
