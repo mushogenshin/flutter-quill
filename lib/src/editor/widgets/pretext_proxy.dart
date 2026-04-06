@@ -163,8 +163,8 @@ class PretextRichText extends LeafRenderObjectWidget {
 ///      Call [prepareInlineFlow] (analysis + per-item measurement).  Result
 ///      is cached — only re-runs when [_textSpan] or style changes, NOT on
 ///      every width-change relayout.
-///   2. Call [walkInlineFlowLines] with the cached flow and the current
-///      [constraints.maxWidth].  Produces one [InlineFlowLine] per visual
+///   2. Call [walkInlineFlowLineRanges] with the cached flow and the current
+///      [constraints.maxWidth].  Produces one [InlineFlowLineRange] per visual
 ///      line.
 ///   3. Map each line back to plain-text offsets via [_advanceCursor], then
 ///      slice the rich [InlineSpan] with [_clipSpan] to build one [TextPainter]
