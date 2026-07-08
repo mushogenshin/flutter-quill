@@ -202,6 +202,13 @@ mixin RawEditorStateTextInputClientMixin on EditorState
   @override
   AutofillScope? get currentAutofillScope => null;
 
+  // `implements TextInputClient` requires re-declaring every member even
+  // though the Flutter interface gives this one a default body — Dart's
+  // `implements` clause doesn't inherit default implementations. Mirrors
+  // the framework default (see TextInputClient.onFocusReceived).
+  @override
+  bool onFocusReceived() => false;
+
   @override
   void updateEditingValue(TextEditingValue value) {
     if (!shouldCreateInputConnection) {
