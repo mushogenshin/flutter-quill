@@ -1090,6 +1090,21 @@ class QuillRawEditorState extends EditorState
   }
 
   void _handleFocusChanged() {
+    // Reconcile the caret blink before the dirty-deferral below. This call is
+    // idempotent (it no-ops unless the timer state disagrees with focus), and
+    // it is the only thing here that must not wait for a clean frame.
+    //
+    // Why: on platforms where `_keyboardVisible` starts false (mobile with a
+    // soft keyboard — desktop and tests hardcode it true),
+    // `_didChangeTextEditingValue` takes its `requestKeyboard() +
+    // _markNeedsBuild()` branch and never reaches
+    // `_onChangeTextEditingValue`, which is the *only* other caller that
+    // starts the blink timer. That leaves `_handleFocusChanged` responsible —
+    // and if it bails out here on `dirty`, a focused editor can end up with
+    // no blink timer at all. The deferred re-run usually recovers, but an
+    // embedder that rebuilds the editor on every document change can keep
+    // re-dirtying it, so the caret intermittently never blinks.
+    _cursorCont.startOrStopCursorTimerIfNeeded(_hasFocus, controller.selection);
     if (dirty) {
       requestKeyboard();
       SchedulerBinding.instance
@@ -1136,13 +1151,21 @@ class QuillRawEditorState extends EditorState
 
     _showCaretOnScreenScheduled = true;
     SchedulerBinding.instance.addPostFrameCallback((_) {
-      if (widget.config.scrollable || _scrollController.hasClients) {
-        _showCaretOnScreenScheduled = false;
+      // Always clear the latch, whatever we decide below. It gates re-entry at
+      // the top of this method, so any path that leaves it set permanently
+      // disables caret reveal for the rest of the editor's life.
+      _showCaretOnScreenScheduled = false;
 
-        if (!mounted) {
-          return;
-        }
+      if (!mounted) {
+        return;
+      }
 
+      // `hasClients` — not `config.scrollable` — is the real precondition:
+      // both `_scrollController.offset` and `.position` assert on an
+      // unattached controller. A scrollable editor whose inner Scrollable is
+      // not attached yet (first frame, or a collapsed ExpansionTile) would
+      // otherwise throw from inside this post-frame callback.
+      if (_scrollController.hasClients) {
         final viewport = RenderAbstractViewport.of(renderEditor);
         final editorOffset =
             renderEditor.localToGlobal(const Offset(0, 0), ancestor: viewport);
