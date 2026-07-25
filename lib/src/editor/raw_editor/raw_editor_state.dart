@@ -347,6 +347,23 @@ class QuillRawEditorState extends EditorState
     assert(debugCheckHasMediaQuery(context));
     super.build(context);
 
+    // Reconcile the caret blink here, not only on event edges.
+    //
+    // The timer is otherwise started from just two places:
+    // `_onChangeTextEditingValue` (unreachable while `_keyboardVisible` is
+    // false, i.e. mobile before the soft keyboard reports visible) and
+    // `_handleFocusChanged` (which defers while `dirty`). Any embedder that
+    // rebuilds the editor as the document changes can starve both paths,
+    // stranding a focused editor with no blink timer — the caret is placed and
+    // typing works, but nothing blinks until the next text change forces
+    // `stopCursorTimer()..startCursorTimer()`.
+    //
+    // Doing it per build makes the state self-healing within one frame. The
+    // call is cheap and idempotent: it starts only when the timer is null and
+    // the editor is focused with a collapsed selection, and stops only when
+    // that stops being true.
+    _cursorCont.startOrStopCursorTimerIfNeeded(_hasFocus, controller.selection);
+
     var doc = controller.document;
     if (doc.isEmpty() && widget.config.placeholder != null) {
       final raw = widget.config.placeholder?.replaceAll(r'"', '\\"');
